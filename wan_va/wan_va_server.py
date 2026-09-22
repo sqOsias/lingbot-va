@@ -1,8 +1,11 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import argparse
+import copy
+import json
 import os
 import sys
 import time
+import random
 from functools import partial
 from PIL import Image
 from diffusers.video_processor import VideoProcessor
@@ -10,6 +13,7 @@ from diffusers.utils import export_to_video
 
 import numpy as np
 import torch
+import wandb
 import torch.nn.functional as F
 from diffusers.pipelines.wan.pipeline_wan import prompt_clean
 from einops import rearrange
@@ -46,6 +50,19 @@ class VA_Server:
         self.save_root = job_config.save_root
         self.dtype = job_config.param_dtype
         self.device = torch.device(f"cuda:{job_config.local_rank}")
+        self.wandb_run = None
+        wandb_enabled = bool(getattr(job_config, "enable_wandb", False)) or os.getenv("RMBENCH_WANDB_ENABLE", "0") == "1"
+        if job_config.local_rank == 0 and wandb_enabled:
+            if os.getenv("WANDB_API_KEY"):
+                wandb.login(host=os.getenv("WANDB_BASE_URL"), key=os.environ["WANDB_API_KEY"])
+            self.wandb_run = wandb.init(
+                entity=os.getenv("WANDB_TEAM_NAME"),
+                project=os.getenv("WANDB_PROJECT", "lingbot-va-rmbench"),
+                name=os.getenv("WANDB_INFERENCE_RUN_NAME", "rmbench-inference"),
+                job_type="inference",
+                mode=os.getenv("WANDB_MODE", "online"),
+                config={"seed": int(getattr(job_config, "seed", 42))},
+            )
         self.enable_offload = getattr(job_config, 'enable_offload', True)  # offload vae & text_encoder to save vram
 
         self.scheduler = FlowMatchScheduler(shift=self.job_config.snr_shift,
@@ -77,14 +94,16 @@ class VA_Server:
             torch_device='cpu' if self.enable_offload else self.device,
         )
 
+        fsdp_cpu_offload = bool(getattr(job_config, "fsdp_cpu_offload", False))
+        transformer_load_device = "cpu" if fsdp_cpu_offload else self.device
         self.transformer = load_transformer(
             os.path.join(job_config.wan22_pretrained_model_name_or_path,
                          'transformer'),
             torch_dtype=self.dtype,
-            torch_device=self.device,
+            torch_device=transformer_load_device,
             attn_mode="torch"
         )
-        shard_fn = shard_model
+        shard_fn = partial(shard_model, cpu_offload=fsdp_cpu_offload)
         self.transformer = _configure_model(model=self.transformer,
                                             shard_fn=shard_fn,
                                             param_dtype=self.dtype,
@@ -379,6 +398,7 @@ class VA_Server:
         self.use_cfg = (self.job_config.guidance_scale > 1) or (self.job_config.action_guidance_scale > 1)
         #### Reset all parameters
         self.frame_st_id = 0
+        self.inference_chunk = 0
         self.init_latent = None
         #### clean vae and transformer cache
         self.transformer.clear_cache(self.cache_name)
@@ -620,7 +640,21 @@ class VA_Server:
             return dict()
         else:
             logger.info(f"################# Infer One Chunk #################")
+            started = time.perf_counter()
             action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
+            if self.wandb_run is not None:
+                values = np.asarray(action, dtype=np.float64)
+                self.wandb_run.log({
+                    "inference/chunk": self.inference_chunk,
+                    "inference/frame_start_id": self.frame_st_id,
+                    "inference/seconds": time.perf_counter() - started,
+                    "inference/action_min": float(values.min()),
+                    "inference/action_max": float(values.max()),
+                    "inference/action_l2_mean": float(
+                        np.linalg.norm(values.reshape(values.shape[0], -1), axis=0).mean()
+                    ),
+                }, step=self.inference_chunk)
+            self.inference_chunk += 1
             return dict(action=action)
     
     def decode_one_video(self, latents, output_type):
@@ -676,7 +710,20 @@ class VA_Server:
 
 def run(args):    
     
-    config = VA_CONFIGS[args.config_name]
+    config = copy.deepcopy(VA_CONFIGS[args.config_name])
+    stats_path = getattr(config, "rmbench_stats_path", None)
+    if stats_path:
+        try:
+            with open(stats_path, encoding="utf-8") as stream:
+                stats = json.load(stream)
+            config.norm_stat = {key: stats[key] for key in ("q01", "q99")}
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(
+                f"RMBench inference statistics not found: {stats_path}. "
+                "Set RMBENCH_LINGBOT_STATS to the trained dataset's stats file."
+            ) from exc
+        except KeyError as exc:
+            raise ValueError(f"Invalid RMBench stats file {stats_path}: missing {exc}") from exc
     port = config.port if args.port is None else args.port
     if args.save_root is not None:
         config.save_root = args.save_root
@@ -687,6 +734,12 @@ def run(args):
     config.rank = rank
     config.local_rank = local_rank
     config.world_size = world_size
+    base_seed = int(getattr(config, "seed", 42))
+    rank_seed = base_seed + rank
+    random.seed(rank_seed)
+    np.random.seed(rank_seed)
+    torch.manual_seed(rank_seed)
+    torch.cuda.manual_seed_all(rank_seed)
     model = VA_Server(config)
     if config.infer_mode == 'i2va':
         logger.info(f"******************************USE I2AV mode******************************")

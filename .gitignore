@@ -1,1 +1,13 @@
 *.pyc
+*.log
+/wandb/
+/artifacts/
+/checkpoints/
+/train_out/
+/.vscode/
+/preflight*.json
+*.pre_*
+/script/rmbench_inference/
+/script/rmbench_train/
+/script/rmbench_data/
+/graphify-out/

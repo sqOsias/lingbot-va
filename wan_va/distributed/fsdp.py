@@ -2,7 +2,7 @@
 import gc
 
 import torch
-from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy, CPUOffloadPolicy
 
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
@@ -17,13 +17,16 @@ def apply_ac(model):
 
 def shard_model(model,
                 param_dtype=torch.bfloat16,
-                reduce_dtype=torch.float32):
+                reduce_dtype=torch.float32,
+                cpu_offload=False):
     mp_policy = MixedPrecisionPolicy(
         param_dtype=param_dtype,
         reduce_dtype=reduce_dtype,
         cast_forward_inputs=False,
     )
     fsdp_config = {"mp_policy": mp_policy, "reshard_after_forward": True}
+    if cpu_offload:
+        fsdp_config["offload_policy"] = CPUOffloadPolicy(pin_memory=True)
 
     for block in model.blocks:
         fully_shard(block.attn1, **fsdp_config)

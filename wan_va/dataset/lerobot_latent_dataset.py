@@ -14,6 +14,7 @@ from einops import rearrange
 from torch.utils.data import DataLoader
 from scipy.spatial.transform import Rotation as R
 from lerobot.constants import HF_LEROBOT_HOME
+import json
 
 def recursive_find_file(directory, filename='info.json'):
     result = []
@@ -47,8 +48,14 @@ def construct_lerobot_multi_processor(config,
     )
     repo_list = recursive_find_file(config.dataset_path, 'info.json')
     repo_list = [v.split('/meta/info.json')[0] for v in repo_list]
-    with Pool(num_init_worker) as pool:
-        datasets_out_lst = pool.map(construct_func, repo_list)
+    if not repo_list:
+        raise FileNotFoundError(f"No LeRobot meta/info.json found under {config.dataset_path}")
+    worker_count = min(num_init_worker, len(repo_list))
+    if worker_count == 1:
+        datasets_out_lst = [construct_func(repo_list[0])]
+    else:
+        with Pool(worker_count) as pool:
+            datasets_out_lst = pool.map(construct_func, repo_list)
                 
     return datasets_out_lst
 
@@ -71,7 +78,7 @@ class MultiLatentLeRobotDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         config,
-        num_init_worker=128,
+        num_init_worker=8,
     ):
         self._datasets = construct_lerobot_multi_processor(config, 
                                                            num_init_worker, 
@@ -148,6 +155,16 @@ class LatentLeRobotDataset(LeRobotDataset):
         self.used_video_keys = config.obs_cam_keys
         self.q01 = np.array(config.norm_stat['q01'], dtype='float')[None]
         self.q99 = np.array(config.norm_stat['q99'], dtype='float')[None]
+        self.dataset_adapter = getattr(config, 'dataset_adapter', None)
+        if self.dataset_adapter == 'rmbench':
+            anchor_path = self.root / 'observation_anchors.json'
+            with anchor_path.open() as stream:
+                anchor_records = json.load(stream).values()
+            self.rmbench_origins = {
+                (int(record['episode_index']), int(record['start_frame'])):
+                    np.asarray(record['origin'], dtype=np.float32)
+                for record in anchor_records
+            }
         self._hf_torch_view = self.hf_dataset.with_format(
                 type='torch',
                 columns=['action'],
@@ -157,8 +174,13 @@ class LatentLeRobotDataset(LeRobotDataset):
 
     def parse_meta(self):
         out = []
+        episode_indices = getattr(self.config, 'episode_indices', None)
+        if episode_indices is not None:
+            episode_indices = {int(value) for value in episode_indices}
         for key, value in self.meta.episodes.items():
             episode_index = value["episode_index"]
+            if episode_indices is not None and int(episode_index) not in episode_indices:
+                continue
             tasks = value["tasks"]
             action_config = value["action_config"]
             for acfg in action_config:
@@ -253,7 +275,85 @@ class LatentLeRobotDataset(LeRobotDataset):
         )
         return out_dict
     
-    def _action_post_process(self, local_start_frame, local_end_frame, latent_frame_ids, action):
+    def _rmbench_action_post_process(
+        self, local_start_frame, local_end_frame, latent_frame_ids, action,
+        episode_index,
+    ):
+        """Apply only RMBench's temporal, coordinate, and channel contract."""
+        start, end = int(local_start_frame), int(local_end_frame)
+        if int(latent_frame_ids[0]) != start:
+            raise ValueError((start, int(latent_frame_ids[0])))
+        frame_stride = int(latent_frame_ids[1] - latent_frame_ids[0])
+        raw = np.asarray(action, dtype=np.float32)
+        origin = self.rmbench_origins[(int(episode_index), start)]
+
+        relative = []
+        for offset in (0, 8):
+            pose = np.concatenate(
+                [origin[None, offset:offset + 7], raw[:, offset:offset + 7]],
+                axis=0,
+            )
+            relative.extend([get_relative_pose(pose)[1:], raw[:, offset + 7:offset + 8]])
+        raw = np.concatenate(relative, axis=1)
+
+        # Adjacent windows overlap by one observation.  Rows [start, end-1)
+        # therefore provide targets for physical frames [start+1, end-1].
+        usable = end - start - 1
+        group = frame_stride * 4
+        raw = raw[:usable]
+
+        if frame_stride != 4 or group != self.config.action_per_frame:
+            raise ValueError(("RMBench APF16 contract", frame_stride, group,
+                              self.config.action_per_frame))
+
+        latent_frame_num = (len(latent_frame_ids) - 1) // 4 + 1
+        required_action_num = latent_frame_num * group
+
+        # Match LingBot's temporal contract for every independently sampled
+        # window: latent/action frame 0 is an observation condition, so its
+        # complete action group is dummy and must not contribute to the loss.
+        # The parquet row at local ``start`` already stores physical action
+        # ``start + 1``; it therefore begins at action frame 1 after padding.
+        raw = np.pad(raw, ((group, 0), (0, 0)), constant_values=0)
+        valid_rows = np.concatenate(
+            [np.zeros(group, dtype=bool), np.ones(usable, dtype=bool)]
+        )
+
+        # The final RMBench window can contain more physical labels than fit
+        # after reserving action frame 0. Follow the official implementation
+        # and truncate at the window horizon before applying tail padding.
+        raw = raw[:required_action_num]
+        valid_rows = valid_rows[:required_action_num]
+        tail_padding = required_action_num - len(raw)
+        if tail_padding:
+            raw = np.pad(raw, ((0, tail_padding), (0, 0)), constant_values=0)
+            valid_rows = np.concatenate(
+                [valid_rows, np.zeros(tail_padding, dtype=bool)]
+            )
+
+        if len(raw) != required_action_num:
+            raise ValueError((start, end, len(raw), latent_frame_num, group))
+
+        raw = np.pad(raw, ((0, 0), (0, 1)), constant_values=0)
+        mask = np.broadcast_to(valid_rows[:, None], raw.shape).copy()
+        mask[:, 16] = False
+        raw = raw[:, self.config.inverse_used_action_channel_ids]
+        mask = mask[:, self.config.inverse_used_action_channel_ids]
+        action_aligned = (raw - self.q01) / (self.q99 - self.q01 + 1e-6) * 2. - 1.
+        action_aligned = np.clip(action_aligned, -1.5, 1.5) * mask
+        action_aligned = rearrange(
+            action_aligned, "(f n) c -> c f n 1", f=latent_frame_num
+        )
+        mask = rearrange(mask, "(f n) c -> c f n 1", f=latent_frame_num)
+        return torch.from_numpy(action_aligned).float(), torch.from_numpy(mask).bool()
+
+    def _action_post_process(self, local_start_frame, local_end_frame, latent_frame_ids, action,
+                             episode_index=None):
+        if self.dataset_adapter == 'rmbench':
+            return self._rmbench_action_post_process(
+                local_start_frame, local_end_frame, latent_frame_ids, action,
+                episode_index,
+            )
         act_shift = int(latent_frame_ids[0] - local_start_frame)
         frame_stride = latent_frame_ids[1] - latent_frame_ids[0]
         action = action[act_shift:]
@@ -303,7 +403,10 @@ class LatentLeRobotDataset(LeRobotDataset):
         ori_data_dict.update(hf_data_frames)
         out_dict = self._cat_video_latents(ori_data_dict)
 
-        out_dict['actions'], out_dict['actions_mask'] = self._action_post_process(local_start_frame, local_end_frame, latent_frame_ids, ori_data_dict['action'])
+        out_dict['actions'], out_dict['actions_mask'] = self._action_post_process(
+            local_start_frame, local_end_frame, latent_frame_ids,
+            ori_data_dict['action'], episode_index=episode_index,
+        )
 
         out_dict['latents'] = out_dict['latents'].permute(3, 0, 1, 2)
         return out_dict

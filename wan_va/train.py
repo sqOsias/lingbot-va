@@ -1,5 +1,6 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import argparse
+import copy
 import os
 import sys
 from pathlib import Path
@@ -45,20 +46,25 @@ from utils import (
 
 from dataset import MultiLatentLeRobotDataset
 import gc
+from functools import partial
+import time
+import random
+import numpy as np
 
 
 class Trainer:
     def __init__(self, config):
         if config.enable_wandb and config.rank == 0:
-            wandb.login(host=os.environ['WANDB_BASE_URL'], key=os.environ['WANDB_API_KEY'])
+            if os.getenv('WANDB_API_KEY'):
+                wandb.login(host=os.getenv('WANDB_BASE_URL'), key=os.environ['WANDB_API_KEY'])
             self.wandb = wandb
             self.wandb.init(
-                entity=os.environ["WANDB_TEAM_NAME"],
-                project=os.getenv("WANDB_PROJECT", "va_robotwin"),
+                entity=os.getenv("WANDB_TEAM_NAME"),
+                project=os.getenv("WANDB_PROJECT", "lingbot-va-rmbench"),
                 # dir=log_dir,
                 config=config,
-                mode="online",
-                name='test_lln'
+                mode=os.getenv("WANDB_MODE", "online"),
+                name=os.getenv("WANDB_RUN_NAME", getattr(config, "run_name", "lingbot-va-rmbench"))
                 # name=os.path.basename(os.path.normpath(job_config.job.dump_folder))
             )
             logger.info("WandB logging enabled")
@@ -67,6 +73,11 @@ class Trainer:
         self.device = torch.device(f"cuda:{config.local_rank}")
         self.dtype = config.param_dtype
         self.patch_size = config.patch_size
+        self.fsdp_cpu_offload = bool(getattr(config, 'fsdp_cpu_offload', False))
+        self.cpu_process_group = (
+            dist.new_group(backend='gloo')
+            if self.fsdp_cpu_offload and dist.is_initialized() else None
+        )
 
         # Load models
         logger.info("Loading models...")
@@ -92,7 +103,7 @@ class Trainer:
         apply_ac(self.transformer)
 
         logger.info("Setting up FSDP...")
-        shard_fn = shard_model
+        shard_fn = partial(shard_model, cpu_offload=self.fsdp_cpu_offload)
         self.transformer = _configure_model(
             model=self.transformer,
             shard_fn=shard_fn,
@@ -110,7 +121,7 @@ class Trainer:
             betas=(config.beta1, config.beta2),
             eps=1e-8,
             weight_decay=config.weight_decay,
-            fused=True,
+            fused=not self.fsdp_cpu_offload,
             foreach=False,
         )
 
@@ -125,16 +136,43 @@ class Trainer:
             num_replicas=config.world_size,
             rank=config.rank,
             shuffle=True,
-            seed=42
+            seed=int(config.seed)
         ) if config.world_size > 1 else None
+        self.loader_generator = torch.Generator().manual_seed(int(config.seed))
         self.train_loader = DataLoader(
             train_dataset,
             batch_size=config.batch_size,
             shuffle=(train_sampler is None), 
             num_workers=config.load_worker,
             sampler=train_sampler,
+            generator=self.loader_generator,
         )
-
+        self.validation_loader = None
+        validation_dataset_path = getattr(config, 'validation_dataset_path', None)
+        if validation_dataset_path:
+            validation_config = copy.deepcopy(config)
+            validation_config.dataset_path = validation_dataset_path
+            validation_config.empty_emb_path = os.path.join(validation_dataset_path, "empty_emb.pt")
+            validation_config.episode_indices = None
+            validation_dataset = MultiLatentLeRobotDataset(config=validation_config)
+            if len(validation_dataset) == 0:
+                raise ValueError("Validation split contains no loadable latent windows")
+            # Every FSDP rank evaluates the same five episodes so all ranks make
+            # the same number of forward calls. The rank-specific fixed noise
+            # seeds additionally average validation loss across three noises.
+            self.validation_loader = DataLoader(
+                validation_dataset, batch_size=1, shuffle=False,
+                num_workers=config.load_worker,
+            )
+            logger.info(
+                "Independent validation dataset: %s (%d windows)",
+                validation_dataset_path, len(validation_dataset),
+            )
+        elif bool(getattr(config, 'enable_early_stop', False)):
+            raise ValueError(
+                "Early stopping requires RMBENCH_VALIDATION_DATASET_PATH"
+            )
+        # TODO set latent scheduler and action scheduler
         self.train_scheduler_latent = FlowMatchScheduler(shift=self.config.snr_shift, sigma_min=0.0, extra_one_step=True)
         self.train_scheduler_latent.set_timesteps(1000, training=True)
         self.train_scheduler_action = FlowMatchScheduler(shift=self.config.action_snr_shift, sigma_min=0.0, extra_one_step=True)
@@ -142,9 +180,15 @@ class Trainer:
 
         self.save_dir = Path(config.save_root) / "checkpoints"
         self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.metrics_path = Path(config.save_root) / "training_metrics.jsonl"
+        self.training_started_at = time.time()
+        if config.rank == 0:
+            self.metrics_path.parent.mkdir(parents=True, exist_ok=True)
+            self.metrics_path.write_text("")
 
         self.gradient_accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
         self.train_loader_iter = None
+        self.validation_history = []
         # if hasattr(config, 'resume_from') and config.resume_from:
         #     self._load_training_state(config.resume_from)
     
@@ -177,7 +221,7 @@ class Trainer:
         patch_f, patch_h, patch_w = self.patch_size
         if action_mode:
             patch_f = patch_h = patch_w = 1
-        
+        # TODO generate grid_id
         latent_grid_id = get_mesh_id(
             latent.shape[-3] // patch_f,  # F
             latent.shape[-2] // patch_h,  # H
@@ -207,8 +251,24 @@ class Trainer:
             targets *= action_mask.float()
             latent *= action_mask.float()
 
+        timesteps_per_batch = timesteps[None].repeat(B, 1)
+        if action_mask is not None:
+            # A fully masked action frame is a deterministic condition/padding
+            # frame. Inference presents such a frame at timestep zero, so use
+            # the same time embedding during training. Partially masked frames
+            # retain their sampled diffusion timestep.
+            valid_action_frames = action_mask.bool().any(dim=(1, 3, 4))
+            if valid_action_frames.shape != (B, F):
+                raise ValueError(
+                    "Action mask frame shape does not match action timesteps: "
+                    f"{tuple(valid_action_frames.shape)} != {(B, F)}"
+                )
+            timesteps_per_batch = timesteps_per_batch.masked_fill(
+                ~valid_action_frames, 0
+            )
+
         return dict(
-            timesteps=timesteps[None].repeat(B, 1),
+            timesteps=timesteps_per_batch,
             noisy_latents=noisy_latents,
             targets=targets,
             latent=latent,
@@ -253,6 +313,58 @@ class Trainer:
             input_dict[key] = value.to(self.device)#.to(self.dtype)
         return input_dict
 
+    @torch.no_grad()
+    def _validation_loss(self):
+        """Evaluate the complete held-out split with deterministic diffusion noise."""
+        if self.validation_loader is None:
+            raise RuntimeError("Validation was requested without a held-out loader")
+        python_state, numpy_state = random.getstate(), np.random.get_state()
+        cpu_state, cuda_state = torch.get_rng_state(), torch.cuda.get_rng_state_all()
+        was_training = self.transformer.training
+        try:
+            validation_seed = int(self.config.seed) + 100000 + int(self.config.rank)
+            random.seed(validation_seed)
+            np.random.seed(validation_seed)
+            torch.manual_seed(validation_seed)
+            torch.cuda.manual_seed_all(validation_seed)
+            self.transformer.eval()
+            values = torch.zeros(3, device=self.device, dtype=torch.float64)
+            for batch in self.validation_loader:
+                batch = {
+                    key: value.to(self.device) if torch.is_tensor(value) else value
+                    for key, value in batch.items()
+                }
+                inputs = self._prepare_input_dict(batch)
+                losses = self.compute_loss(inputs, self.transformer(inputs, train_mode=True))
+                values[0] += losses[0].double()
+                values[1] += losses[1].double()
+                values[2] += 1
+            if dist.is_initialized():
+                dist.all_reduce(values, op=dist.ReduceOp.SUM)
+            if values[2].item() == 0:
+                raise RuntimeError("Validation loader produced zero batches")
+            return float((values[0] / values[2]).cpu()), float((values[1] / values[2]).cpu())
+        finally:
+            if was_training:
+                self.transformer.train()
+            random.setstate(python_state)
+            np.random.set_state(numpy_state)
+            torch.set_rng_state(cpu_state)
+            torch.cuda.set_rng_state_all(cuda_state)
+
+    def _validation_converged(self):
+        patience = int(getattr(self.config, "early_stop_patience", 5))
+        delta = float(getattr(self.config, "early_stop_min_relative_improvement", 0.01))
+        if len(self.validation_history) < patience + 1:
+            return False
+        recent = self.validation_history[-(patience + 1):]
+        def stalled(key):
+            baseline = recent[0][key]
+            best_later = min(record[key] for record in recent[1:])
+            improvement = (baseline - best_later) / max(abs(baseline), 1e-12)
+            return improvement < delta
+        return stalled("latent") and stalled("action")
+
     def compute_loss(self,
         input_dict,
         pred
@@ -290,7 +402,18 @@ class Trainer:
         # Sum per frame and normalize by mask per frame
         action_loss_per_frame = action_loss.sum(dim=1)  # (B*F,)
         action_mask_per_frame = action_mask.sum(dim=1)  # (B*F,)
-        action_loss = (action_loss_per_frame / (action_mask_per_frame + 1e-6)).mean()
+        # RMBench reserves fully masked action frames for the initial
+        # observation condition and any tail padding. Exclude those frames
+        # from the outer mean while preserving LingBot's per-frame weighting.
+        valid_action_frames = action_mask_per_frame > 0
+        if not torch.any(valid_action_frames):
+            raise ValueError(
+                "Action loss received a batch with no valid action frames"
+            )
+        action_loss = (
+            action_loss_per_frame[valid_action_frames]
+            / action_mask_per_frame[valid_action_frames]
+        ).mean()
 
         return latent_loss / self.gradient_accumulation_steps, action_loss / self.gradient_accumulation_steps
 
@@ -316,7 +439,7 @@ class Trainer:
         
         # Only update weights after accumulating gradients
         if should_sync:
-            total_norm = torch.nn.utils.clip_grad_norm_(self.transformer.parameters(), 2.0)
+            total_norm = self._clip_grad_norm(2.0)
             self.optimizer.step()
             self.lr_scheduler.step()
             self.optimizer.zero_grad()
@@ -327,6 +450,34 @@ class Trainer:
             losses['should_log'] = False
 
         return losses
+
+    @torch.no_grad()
+    def _clip_grad_norm(self, max_norm):
+        if not self.fsdp_cpu_offload:
+            return torch.nn.utils.clip_grad_norm_(
+                self.transformer.parameters(), max_norm
+            )
+
+        local_gradients = []
+        local_sq_sum = torch.zeros((), dtype=torch.float64, device='cpu')
+        for parameter in self.transformer.parameters():
+            if parameter.grad is None:
+                continue
+            gradient = parameter.grad
+            local_gradient = (
+                gradient.to_local() if hasattr(gradient, 'to_local') else gradient
+            )
+            local_gradients.append(local_gradient)
+            local_sq_sum += local_gradient.detach().double().square().sum()
+        if dist.is_initialized():
+            dist.all_reduce(local_sq_sum, op=dist.ReduceOp.SUM,
+                            group=self.cpu_process_group)
+        total_norm = local_sq_sum.sqrt()
+        coefficient = min(float(max_norm) / (total_norm.item() + 1e-6), 1.0)
+        if coefficient < 1.0:
+            for local_gradient in local_gradients:
+                local_gradient.mul_(coefficient)
+        return total_norm.float()
 
     def save_checkpoint(self,):
         """Save model checkpoint in the same format as pretrained model."""
@@ -438,6 +589,7 @@ class Trainer:
         accumulated_action_losses = []
         step_in_accumulation = 0
 
+        stop_reason = "max_steps"
         while self.step < self.config.num_steps:
             # Get next batch (handles epoch reset automatically)
             batch = self._get_next_batch()
@@ -471,6 +623,18 @@ class Trainer:
 
                 if self.config.rank == 0:
                     total_norm = losses['total_norm']
+                    metric = {
+                        'optimizer_step': self.step + 1,
+                        'latent_loss': latent_loss_show,
+                        'action_loss': action_loss_show,
+                        'max_latent_loss': max_latent_loss_show,
+                        'max_action_loss': max_action_loss_show,
+                        'grad_norm': total_norm.item(),
+                        'lr': lr,
+                        'elapsed_seconds': time.time() - self.training_started_at,
+                    }
+                    with self.metrics_path.open('a') as stream:
+                        stream.write(json.dumps(metric) + '\n')
                     progress_bar.n += 1
                     progress_bar.set_postfix({
                         'latent_loss': f'{latent_loss_show:.4f}',
@@ -490,23 +654,82 @@ class Trainer:
                         }, step=self.step)
                 
                 self.step += 1
+
+                validation_interval = int(getattr(self.config, "early_stop_check_interval", 0))
+                should_stop = False
+                if (bool(getattr(self.config, "enable_early_stop", False))
+                        and validation_interval and self.step % validation_interval == 0):
+                    validation_latent, validation_action = self._validation_loss()
+                    if self.config.rank == 0:
+                        record = {"step": self.step, "latent": validation_latent,
+                                  "action": validation_action}
+                        self.validation_history.append(record)
+                        with (Path(self.config.save_root) / "validation_metrics.jsonl").open("a") as stream:
+                            stream.write(json.dumps(record) + "\n")
+                        if self.config.enable_wandb:
+                            self.wandb.log({"validation/latent_loss": validation_latent,
+                                            "validation/action_loss": validation_action},
+                                           step=self.step)
+                        should_stop = (
+                            self.step >= int(getattr(self.config, "early_stop_min_steps", 0))
+                            and self._validation_converged()
+                        )
+                    decision = [should_stop]
+                    if dist.is_initialized():
+                        dist.broadcast_object_list(decision, src=0)
+                    should_stop = decision[0]
                 
                 if self.step % self.config.save_interval == 0:
                     if self.config.rank == 0:
                         logger.info(f"Starting save model at step {self.step}")
                     self.save_checkpoint()
 
+                if should_stop:
+                    stop_reason = "held_out_validation_losses_converged"
+                    if self.config.rank == 0:
+                        logger.info(f"Early stopping at step {self.step}: {stop_reason}")
+                    self.save_checkpoint()
+                    break
+
             if dist.is_initialized():
                 dist.barrier()
 
         progress_bar.close()
+        # A short smoke run may end before the periodic save interval. Always
+        # persist its final optimizer step so the complete training path is tested.
+        if stop_reason == "max_steps" and self.step % self.config.save_interval != 0:
+            if self.config.rank == 0:
+                logger.info(f"Saving final model at step {self.step}")
+            self.save_checkpoint()
+        if self.config.rank == 0:
+            summary = {"stop_step": self.step, "stop_reason": stop_reason,
+                       "validation_history": self.validation_history}
+            (Path(self.config.save_root) / "training_summary.json").write_text(
+                json.dumps(summary, indent=2) + "\n")
+            if self.config.enable_wandb:
+                self.wandb.summary.update({"stop_step": self.step, "stop_reason": stop_reason})
+                self.wandb.finish()
         logger.info("Training completed!")
 
 
 def run(args):
     """Main entry point."""
-    config = VA_CONFIGS[args.config_name]
+    config = copy.deepcopy(VA_CONFIGS[args.config_name])
+    if getattr(config, "dataset_adapter", None) == "rmbench":
+        stats_path = Path(config.dataset_path) / "rmbench_action_stats.json"
+        try:
+            with stats_path.open() as stream:
+                stats = json.load(stream)
+            config.norm_stat = {key: stats[key] for key in ("q01", "q99")}
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(
+                f"RMBench action statistics not found: {stats_path}. "
+                "Set RMBENCH_DATASET_PATH to a prepared dataset."
+            ) from exc
+        except KeyError as exc:
+            raise ValueError(f"Invalid RMBench stats file {stats_path}: missing {exc}") from exc
 
+    # TODO init distributed environment
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -517,8 +740,17 @@ def run(args):
     config.local_rank = local_rank
     config.world_size = world_size
 
+    base_seed = int(getattr(config, "seed", 42))
+    rank_seed = base_seed + rank
+    random.seed(rank_seed)
+    np.random.seed(rank_seed)
+    torch.manual_seed(rank_seed)
+    torch.cuda.manual_seed_all(rank_seed)
+
     if args.save_root is not None:
         config.save_root = args.save_root
+    if args.num_steps is not None:
+        config.num_steps = args.num_steps
 
     if rank == 0:
         logger.info(f"Using config: {args.config_name}")
@@ -526,6 +758,8 @@ def run(args):
 
     trainer = Trainer(config)
     trainer.train()
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def main():
@@ -542,6 +776,12 @@ def main():
         type=str,
         default=None,
         help="Root directory for saving checkpoints",
+    )
+    parser.add_argument(
+        "--num-steps",
+        type=int,
+        default=None,
+        help="Override the config's maximum optimizer steps (for example 10 for smoke testing)",
     )
 
     args = parser.parse_args()
