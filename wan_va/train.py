@@ -45,6 +45,9 @@ from utils import (
 )
 
 from dataset import MultiLatentLeRobotDataset
+from dataset.bounded_full_context_dataset import (
+    BoundedFullContextDataset, EpisodeBalancedDistributedSampler,
+)
 import gc
 from functools import partial
 import time
@@ -130,14 +133,21 @@ class Trainer:
 
         # Setup dataloaders
         logger.info("Setting up datasets...")
-        train_dataset = MultiLatentLeRobotDataset(config=config)
-        train_sampler = DistributedSampler(
-            train_dataset,
-            num_replicas=config.world_size,
-            rank=config.rank,
-            shuffle=True,
-            seed=int(config.seed)
-        ) if config.world_size > 1 else None
+        bounded = bool(getattr(config,'bounded_window_index',None))
+        if bounded:
+            train_dataset = BoundedFullContextDataset(config, config.bounded_window_index)
+            train_sampler = EpisodeBalancedDistributedSampler(
+                train_dataset, config.world_size, config.rank, seed=int(config.seed)
+            )
+        else:
+            train_dataset = MultiLatentLeRobotDataset(config=config)
+            train_sampler = DistributedSampler(
+                train_dataset,
+                num_replicas=config.world_size,
+                rank=config.rank,
+                shuffle=True,
+                seed=int(config.seed)
+            ) if config.world_size > 1 else None
         self.loader_generator = torch.Generator().manual_seed(int(config.seed))
         self.train_loader = DataLoader(
             train_dataset,
@@ -210,14 +220,16 @@ class Trainer:
 
     @torch.no_grad()
     def _add_noise(self, latent, train_scheduler, action_mask=False, action_mode=False, noisy_cond_prob=0.):
+        # 输入形状：[batch, channel, frame, height, width]
         B, C, F, H, W = latent.shape
-
+        # 为每个时间帧随机采样扩散时刻timestep_ids
         timestep_ids = sample_timestep_id(batch_size=F, num_train_timesteps=train_scheduler.num_train_timesteps)
+        # 生成噪声，构造模型输入和监督目标
         noise = torch.zeros_like(latent).normal_()
         timesteps = train_scheduler.timesteps[timestep_ids].to(device=self.device)
         noisy_latents =train_scheduler.add_noise(latent, noise, timesteps, t_dim=2)
         targets =train_scheduler.training_target(latent, noise, timesteps)
-
+        # 视频按照 patch 划分；动作不划分 patch
         patch_f, patch_h, patch_w = self.patch_size
         if action_mode:
             patch_f = patch_h = patch_w = 1
@@ -232,7 +244,7 @@ class Trainer:
             action=action_mode
         ).to(self.device)  # shape: [4, seq_len]
         latent_grid_id = latent_grid_id[None].repeat(B, 1, 1)
-
+        # 随机给条件 latent 加噪，模拟推理时不完美的历史条件
         if torch.rand(1).item() < noisy_cond_prob:
             cond_timestep_ids = sample_timestep_id(
                     batch_size=F,
@@ -250,9 +262,10 @@ class Trainer:
             noisy_latents *= action_mask.float()
             targets *= action_mask.float()
             latent *= action_mask.float()
-
+        # 所有 batch 样本共用同一组逐帧 timestep
         timesteps_per_batch = timesteps[None].repeat(B, 1)
         if action_mask is not None:
+             # 判断每个动作帧是否至少包含一个有效动作
             # A fully masked action frame is a deterministic condition/padding
             # frame. Inference presents such a frame at timestep zero, so use
             # the same time embedding during training. Partially masked frames
@@ -268,12 +281,12 @@ class Trainer:
             )
 
         return dict(
-            timesteps=timesteps_per_batch,
-            noisy_latents=noisy_latents,
-            targets=targets,
-            latent=latent,
-            cond_timesteps=cond_timesteps[None].repeat(B, 1),
-            grid_id=latent_grid_id,
+            timesteps=timesteps_per_batch,                    # 主输入噪声时刻 shape: [B, seq_len]
+            noisy_latents=noisy_latents,                      # 主输入噪声 shape: [B, C, seq_len, H, W]
+            targets=targets,                                  # 主输入噪声监督目标 shape: [B, C, seq_len, H, W]
+            latent=latent,                                    # 条件噪声 shape: [B, C, seq_len, H, W]
+            cond_timesteps=cond_timesteps[None].repeat(B, 1), # 条件噪声时刻 shape: [B, seq_len]
+            grid_id=latent_grid_id,                           # 输入网格索引 shape: [B, seq_len, 4]
         )
 
     @torch.no_grad()
@@ -621,6 +634,7 @@ class Trainer:
                     torch.cuda.empty_cache()
                     gc.collect()
 
+                #写 training_metrics.jsonl；更新进度条；上传 WandB
                 if self.config.rank == 0:
                     total_norm = losses['total_norm']
                     metric = {
@@ -654,7 +668,7 @@ class Trainer:
                         }, step=self.step)
                 
                 self.step += 1
-
+                # 是否到验证间隔50步；是否到保存间隔3000步；是否满足early stop
                 validation_interval = int(getattr(self.config, "early_stop_check_interval", 0))
                 should_stop = False
                 if (bool(getattr(self.config, "enable_early_stop", False))
@@ -735,6 +749,18 @@ def run(args):
     world_size = int(os.environ.get("WORLD_SIZE", 1))
 
     init_distributed(world_size, local_rank, rank)
+
+    if os.environ.get("RMBENCH_DEBUGPY") == "1" and rank == 0:
+        import debugpy
+
+        port = int(os.environ.get("RMBENCH_DEBUGPY_PORT", "5678"))
+        debugpy.listen(("0.0.0.0", port))
+        print(f"[rank 0] waiting for debugger on port {port}", flush=True)
+        debugpy.wait_for_client()
+        print("[rank 0] debugger attached", flush=True)
+
+    if dist.is_initialized():
+        dist.barrier()
 
     config.rank = rank
     config.local_rank = local_rank

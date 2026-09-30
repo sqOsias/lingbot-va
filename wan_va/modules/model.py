@@ -230,13 +230,13 @@ class WanTimeTextImageEmbedding(nn.Module):
     ):
         B, L = timestep.shape
         timestep = timestep.reshape(-1)
-        timestep = self.timesteps_proj(timestep)
+        timestep = self.timesteps_proj(timestep) # 正弦/频率编码，变成256维
         # time_embedder_dtype = next(iter(self.time_embedder.parameters())).dtype
         time_embedder_dtype = self.time_embedder.linear_1.weight.dtype
         if timestep.dtype != time_embedder_dtype and time_embedder_dtype != torch.int8:
             timestep = timestep.to(time_embedder_dtype)
-        temb = self.time_embedder(timestep).to(dtype=dtype)
-        timestep_proj = self.time_proj(self.act_fn(temb))
+        temb = self.time_embedder(timestep).to(dtype=dtype) # 线性映射，变成3072维
+        timestep_proj = self.time_proj(self.act_fn(temb)) # 扩展为 6×3072 维
         return temb.reshape(B, L, -1), timestep_proj.reshape(B, L, -1)
 
 
@@ -266,6 +266,7 @@ class WanRotaryPosEmbed(nn.Module):
         self.w_freqs_base = w_freqs_base
 
     def _precompute_freqs_base(self):
+        # 生成一组从高到低、按指数间隔排列的旋转频率
         # freqs_base = 1.0 / (theta ** (2k / dim))
         f_freqs_base = 1.0 / (self.theta**(torch.arange(
             0, self.f_dim, 2)[:(self.f_dim // 2)].double() / self.f_dim))
@@ -276,12 +277,13 @@ class WanRotaryPosEmbed(nn.Module):
         return f_freqs_base, h_freqs_base, w_freqs_base
 
     def forward(self, grid_ids):
+        """为每个 token 生成时间和空间旋转角度"""
         with torch.no_grad():
-            f_freqs = grid_ids[:, 0, :].unsqueeze(-1) * self.f_freqs_base.to(grid_ids.device)
-            h_freqs = grid_ids[:, 1, :].unsqueeze(-1) * self.h_freqs_base.to(grid_ids.device)
-            w_freqs = grid_ids[:, 2, :].unsqueeze(-1) * self.w_freqs_base.to(grid_ids.device)
+            f_freqs = grid_ids[:, 0, :].unsqueeze(-1) * self.f_freqs_base.to(grid_ids.device) # 时间旋转角度 [1,7072,22]
+            h_freqs = grid_ids[:, 1, :].unsqueeze(-1) * self.h_freqs_base.to(grid_ids.device) # 高度旋转角度 [1,7072,21]
+            w_freqs = grid_ids[:, 2, :].unsqueeze(-1) * self.w_freqs_base.to(grid_ids.device) # 宽度旋转角度 [1,7072,21]
             freqs = torch.cat([f_freqs, h_freqs, w_freqs], dim=-1).float()
-            freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+            freqs_cis = torch.polar(torch.ones_like(freqs), freqs) # 每个角度转成单位复数
 
         return freqs_cis
 
@@ -422,13 +424,14 @@ class WanAttention(torch.nn.Module):
     ):
         kv_cache = self.attn_caches[
             cache_name] if (self.attn_caches is not None) and (cache_name in self.attn_caches) else None
-
+        # 三个独立线性层将输入投影为 Q、K、V，只对 Q、K 做 RMSNorm，提高 attention 数值稳定性
         query, key, value = self.to_q(q), self.to_k(k), self.to_v(v)
         query = self.norm_q(query)
-        query = query.unflatten(2, (self.heads, -1))
+        query = query.unflatten(2, (self.heads, -1)) # 拆分24个 attention head
         key = self.norm_k(key)
         key = key.unflatten(2, (self.heads, -1))
         value = value.unflatten(2, (self.heads, -1))
+        # 只有 self-attention 使用 RoPE
         if rotary_emb is not None:
 
             def apply_rotary_emb(x, freqs):
@@ -521,7 +524,13 @@ class WanTransformerBlock(nn.Module):
         update_cache=0,
         cache_name='pos',
     ) -> torch.Tensor:
-        temb_scale_shift_table = self.scale_shift_table[None] + temb.float()
+        """
+        hidden_states: noisy video token;condition video token;noisy action token;clean action token;padding token
+        encoder_hidden_states: task txt token
+        temb: time embedding [B,L,6,D]
+        rotary_emb: Each token 3D RoPE rotation factor used to add time, height, and width position information to the Q and K of self-attention [B,L,1,D]
+        """
+        temb_scale_shift_table = self.scale_shift_table[None] + temb.float() # 把 timestep 生成的6组动态参数，与当前 Transformer block 自己学习的基础参数相加
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = \
             rearrange(temb_scale_shift_table, 'b l n c -> b n l c').chunk(6, dim=1)
         shift_msa = shift_msa.squeeze(1)
@@ -669,31 +678,41 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                       self.attention_head_dim, device, dtype, batch_size)
     
     def _input_embed(self, latents, input_type='latent'):
+        """把视频、动作或文本转换成 Transformer token。"""
         if input_type == 'latent':
+            # 视频：[B,C,F,H,W] → 切分时空 patch
+            # 输出：[B, token数量, 每个patch的特征数]
             hidden_states = rearrange(
                 latents,
                 'b c (f p1) (h p2) (w p3) -> b (f h w) (c p1 p2 p3)',
                 p1=self.patch_size[0],
                 p2=self.patch_size[1],
                 p3=self.patch_size[2])
+            # 将视频 patch 特征投影到 Transformer hidden size（3072）
             hidden_states = self.patch_embedding_mlp(hidden_states)
         elif input_type == 'action':
+            # 每个动作时间点变成一个 token
             hidden_states = rearrange(latents, 'b c f h w -> b (f h w) c')
             hidden_states = self.action_embedder(hidden_states)
         elif input_type == 'text':
+            # 文本：[B,512,4096] → [B,512,3072]
             hidden_states = self.condition_embedder.text_embedder(latents)
         else:
             raise ValueError(f"Unsupported input type: {input_type}")
         return hidden_states
 
     def _time_embed(self, timesteps, H, W, dtype, action_mode=False):
-        pach_scale_h, pach_scale_w = (1, 1) if action_mode else (
+        """把每帧的 diffusion timestep 转换成每个 token 的时间 embedding。"""
+        patch_scale_h, patch_scale_w = (1, 1) if action_mode else (
             self.patch_size[1], self.patch_size[2])
+        # 一个时间帧包含多个空间/动作 token，
+        # 因此把该帧的 timestep 复制给帧内所有 token
         latent_time_steps = torch.repeat_interleave(
             timesteps,
-            (H // pach_scale_h) *
-            (W // pach_scale_w), dim=1)  # L
+            (H // patch_scale_h) *
+            (W // patch_scale_w), dim=1)  # L
         current_condition_embedder = self.condition_embedder_action if action_mode else self.condition_embedder
+        # 将标量 timestep 编码成 Transformer 可用的特征
         temb, timestep_proj = current_condition_embedder(
             latent_time_steps, dtype=dtype)
         timestep_proj = timestep_proj.unflatten(2, (6, -1))  # B L 6 C

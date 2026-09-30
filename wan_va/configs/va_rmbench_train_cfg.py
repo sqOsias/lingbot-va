@@ -22,6 +22,7 @@ va_rmbench_train_cfg.wan22_pretrained_model_name_or_path = os.environ.get(
 va_rmbench_train_cfg.dataset_adapter = "rmbench"
 va_rmbench_train_cfg.enable_wandb = True
 va_rmbench_train_cfg.fsdp_cpu_offload = True
+# va_rmbench_train_cfg.load_worker = 4
 va_rmbench_train_cfg.num_steps = 3000
 va_rmbench_train_cfg.save_interval = 3000
 va_rmbench_train_cfg.seed = 42
@@ -34,3 +35,6 @@ va_rmbench_train_cfg.early_stop_patience = int(os.environ.get("RMBENCH_EARLY_STO
 va_rmbench_train_cfg.early_stop_min_relative_improvement = float(
     os.environ.get("RMBENCH_EARLY_STOP_MIN_RELATIVE_IMPROVEMENT", 0.01)
 )
+# Opt-in only. Existing Rearrange/Observe/full-context runs are unchanged.
+va_rmbench_train_cfg.bounded_window_index = os.environ.get("RMBENCH_BOUNDED_TRAIN_INDEX")
+va_rmbench_train_cfg.bounded_validation_index = os.environ.get("RMBENCH_BOUNDED_VALIDATION_INDEX")
