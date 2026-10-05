@@ -1,7 +1,8 @@
 # LingBot-VA / MemoryWAM 迁移到本地电脑操作文档
 
 日期：2026-10-05
-代码仓库：`https://github.com/Robbyant/lingbot-va`
+代码快照：`https://github.com/sqOsias/lingbot-va`
+上游仓库：`https://github.com/Robbyant/lingbot-va`
 代码分支：`codex/memorywam-mechanism-v1`
 
 ## 1. 迁移边界
@@ -81,7 +82,7 @@ $LOCAL_WORK/
 ```bash
 mkdir -p "$LOCAL_WORK"
 git clone --branch codex/memorywam-mechanism-v1 --single-branch \
-  https://github.com/Robbyant/lingbot-va.git "$LINGBOT_VA_REPO"
+  https://github.com/sqOsias/lingbot-va.git "$LINGBOT_VA_REPO"
 cd "$LINGBOT_VA_REPO"
 git status --short --branch
 ```
