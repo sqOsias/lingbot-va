@@ -1,4 +1,5 @@
 *.pyc
+__pycache__/
 *.log
 /wandb/
 /artifacts/
@@ -7,7 +8,12 @@
 /.vscode/
 /preflight*.json
 *.pre_*
-/script/rmbench_inference/
-/script/rmbench_train/
-/script/rmbench_data/
 /graphify-out/
+/docs/*.pdf
+/docs/*inventory*.json
+/docs/*inventory*.csv
+/docs/rmbench_contracts*.json
+/docs/rmbench_cpu_checks*.json
+/docs/rmbench_mask*.json
+/docs/rmbench_provenance*.json
+/docs/memorywam_toy_recall*.json

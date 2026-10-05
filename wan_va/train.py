@@ -23,7 +23,7 @@ import json
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from configs import VA_CONFIGS
-from distributed.fsdp import shard_model, apply_ac
+from distributed.fsdp import shard_model, apply_ac, resolve_fsdp_topology
 from distributed.util import (
     _configure_model, 
     init_distributed, 
@@ -77,6 +77,24 @@ class Trainer:
         self.dtype = config.param_dtype
         self.patch_size = config.patch_size
         self.fsdp_cpu_offload = bool(getattr(config, 'fsdp_cpu_offload', False))
+        self.fsdp_shard_size = int(getattr(config, 'fsdp_shard_size', 0))
+        self.fsdp_reshard_after_forward = bool(getattr(
+            config, 'fsdp_reshard_after_forward', True))
+        self.fsdp_root_reshard_after_forward = bool(getattr(
+            config, 'fsdp_root_reshard_after_forward', True))
+        self.fsdp_topology = resolve_fsdp_topology(
+            config.world_size, self.fsdp_shard_size)
+        if config.rank == 0:
+            logger.info(
+                "FSDP topology: world=%d shard=%d replicate=%d HSDP=%s "
+                "cpu_offload=%s reshard=%s root_reshard=%s",
+                self.fsdp_topology.world_size,
+                self.fsdp_topology.shard_size,
+                self.fsdp_topology.replicate_size,
+                self.fsdp_topology.uses_hsdp,
+                self.fsdp_cpu_offload,
+                self.fsdp_reshard_after_forward,
+                self.fsdp_root_reshard_after_forward)
         self.cpu_process_group = (
             dist.new_group(backend='gloo')
             if self.fsdp_cpu_offload and dist.is_initialized() else None
@@ -101,12 +119,23 @@ class Trainer:
             torch_device='cpu',
             attn_mode="flex"
         )
+        if getattr(config, "memorywam_enabled", False):
+            self.transformer.enable_memorywam(
+                config.memorywam_gist_tokens,
+                config.memorywam_anchor_frames,
+                config.memorywam_recent_frames,
+                config.memorywam_mode)
 
         logger.info("Setting up activation checkpointing ...")
         apply_ac(self.transformer)
 
         logger.info("Setting up FSDP...")
-        shard_fn = partial(shard_model, cpu_offload=self.fsdp_cpu_offload)
+        shard_fn = partial(
+            shard_model,
+            cpu_offload=self.fsdp_cpu_offload,
+            shard_size=self.fsdp_shard_size,
+            reshard_after_forward=self.fsdp_reshard_after_forward,
+            root_reshard_after_forward=self.fsdp_root_reshard_after_forward)
         self.transformer = _configure_model(
             model=self.transformer,
             shard_fn=shard_fn,
@@ -134,6 +163,14 @@ class Trainer:
         # Setup dataloaders
         logger.info("Setting up datasets...")
         bounded = bool(getattr(config,'bounded_window_index',None))
+        if getattr(config, "memorywam_enabled", False):
+            if bounded:
+                raise ValueError(
+                    "MemoryWAM episode sequencing is not implemented for the "
+                    "legacy bounded-window wrapper")
+            if not getattr(config, "memory_alignment_path", None):
+                raise ValueError(
+                    "MemoryWAM requires RMBENCH_MEMORY_ALIGNMENT_PATH")
         if bounded:
             train_dataset = BoundedFullContextDataset(config, config.bounded_window_index)
             train_sampler = EpisodeBalancedDistributedSampler(
@@ -164,6 +201,8 @@ class Trainer:
             validation_config.dataset_path = validation_dataset_path
             validation_config.empty_emb_path = os.path.join(validation_dataset_path, "empty_emb.pt")
             validation_config.episode_indices = None
+            validation_config.memory_alignment_path = getattr(
+                config, "validation_memory_alignment_path", None)
             validation_dataset = MultiLatentLeRobotDataset(config=validation_config)
             if len(validation_dataset) == 0:
                 raise ValueError("Validation split contains no loadable latent windows")
@@ -299,7 +338,8 @@ class Trainer:
             train_scheduler=self.train_scheduler_latent, 
             action_mask=None, 
             action_mode=False,
-            noisy_cond_prob=0.5)
+            noisy_cond_prob=(0.0 if getattr(self.config, "memorywam_enabled",
+                                            False) else 0.5))
         
         action_dict = self._add_noise(
             latent=batch_dict['actions'], 
@@ -318,12 +358,28 @@ class Trainer:
             'chunk_size': torch.randint(1, 5, (1,)).item(),
             'window_size': torch.randint(4, 65, (1,)).item(),
         }
+        memory_keys = (
+            "dataset_numeric_id", "episode_index", "segment_index",
+            "global_frame_ids", "source_rgb_indices", "decision_frame_ids",
+            "target_frame_ids", "target_action_group_ids",
+            "video_target_mask", "action_valid_slots_by_latent", "reset_mask",
+        )
+        if any(key in batch_dict for key in memory_keys):
+            missing = [key for key in memory_keys if key not in batch_dict]
+            if missing:
+                raise ValueError(f"Incomplete MemoryWAM batch metadata: {missing}")
+            input_dict["memory_meta"] = {
+                key: batch_dict[key] for key in memory_keys
+            }
+            input_dict["memory_meta"]["detach_interval"] = int(getattr(
+                self.config, "memorywam_detach_interval", 0))
         return input_dict
 
     def convert_input_format(self, input_dict):
         """Convert input dict to match transformer input format if needed."""
         for key, value in input_dict.items():
-            input_dict[key] = value.to(self.device)#.to(self.dtype)
+            if torch.is_tensor(value):
+                input_dict[key] = value.to(self.device)#.to(self.dtype)
         return input_dict
 
     @torch.no_grad()
@@ -401,7 +457,19 @@ class Trainer:
         # Sum per frame and compute mask per frame
         latent_loss_per_frame = latent_loss.sum(dim=1)  # (B*F,)
         latent_mask_per_frame = torch.ones_like(latent_loss).sum(dim=1)  # (B*F,)
-        latent_loss = (latent_loss_per_frame / (latent_mask_per_frame + 1e-6)).mean()
+        if "memory_meta" in input_dict:
+            video_target_mask = input_dict["memory_meta"][
+                "video_target_mask"].reshape(-1).bool()
+            if video_target_mask.shape != latent_loss_per_frame.shape:
+                raise ValueError(("video target mask shape",
+                                  tuple(video_target_mask.shape),
+                                  tuple(latent_loss_per_frame.shape)))
+            if not torch.any(video_target_mask):
+                raise ValueError("MemoryWAM batch has no video targets")
+            latent_loss_per_frame = latent_loss_per_frame[video_target_mask]
+            latent_mask_per_frame = latent_mask_per_frame[video_target_mask]
+        latent_loss = (latent_loss_per_frame /
+                       (latent_mask_per_frame + 1e-6)).mean()
 
         # Frame-wise action loss calculation
         action_loss = F.mse_loss(action_pred.float(), input_dict['action_dict']['targets'].float().detach(), reduction='none')
@@ -453,16 +521,64 @@ class Trainer:
         # Only update weights after accumulating gradients
         if should_sync:
             total_norm = self._clip_grad_norm(2.0)
+            gist_grad_norm = None
+            gist_before = None
+            if (getattr(self.config, "memorywam_enabled", False) and
+                    self.transformer.memorywam_policy.gist_per_frame):
+                gist_grad_norm = self._parameter_grad_norm(
+                    self.transformer.gist_tokens)
+                gist_before = self._local_parameter_copy(
+                    self.transformer.gist_tokens)
             self.optimizer.step()
             self.lr_scheduler.step()
+            if gist_before is not None:
+                gist_update_max = self._parameter_update_max(
+                    self.transformer.gist_tokens, gist_before)
             self.optimizer.zero_grad()
             
             losses['total_norm'] = total_norm
+            if gist_grad_norm is not None:
+                losses['gist_grad_norm'] = gist_grad_norm
+                losses['gist_update_max'] = gist_update_max
             losses['should_log'] = True
         else:
             losses['should_log'] = False
 
         return losses
+
+    @torch.no_grad()
+    def _parameter_grad_norm(self, parameter):
+        """Return a global L2 norm for a possibly sharded parameter grad."""
+        if parameter.grad is None:
+            return torch.zeros((), device=self.device)
+        gradient = parameter.grad
+        if hasattr(gradient, 'to_local'):
+            gradient = gradient.to_local()
+        square = gradient.detach().double().square().sum()
+        if dist.is_initialized():
+            dist.all_reduce(square, op=dist.ReduceOp.SUM)
+        return square.sqrt().float()
+
+    @staticmethod
+    @torch.no_grad()
+    def _local_parameter_copy(parameter):
+        value = parameter.detach()
+        if hasattr(value, 'to_local'):
+            value = value.to_local()
+        return value.float().clone()
+
+    @torch.no_grad()
+    def _parameter_update_max(self, parameter, before):
+        after = parameter.detach()
+        if hasattr(after, 'to_local'):
+            after = after.to_local()
+        if before.numel():
+            update = (after.float() - before).abs().max()
+        else:
+            update = torch.zeros((), device=self.device)
+        if dist.is_initialized():
+            dist.all_reduce(update, op=dist.ReduceOp.MAX)
+        return update
 
     @torch.no_grad()
     def _clip_grad_norm(self, max_norm):
@@ -548,9 +664,12 @@ class Trainer:
                 logger.error(f"Failed to save checkpoint: {e}")
                 import traceback
                 logger.error(traceback.format_exc())
-            # Ensure all processes stay synchronized even on error
+            # A run without a complete checkpoint must fail.  Swallowing this
+            # exception can leave a training_summary.json that falsely looks
+            # successful while the only checkpoint is partial or absent.
             if dist.is_initialized():
                 dist.barrier()
+            raise
 
     def _load_training_state(self, checkpoint_path):
         """Load training state (optimizer + step) after FSDP and optimizer creation."""
@@ -600,12 +719,18 @@ class Trainer:
         self.optimizer.zero_grad()
         accumulated_latent_losses = []
         accumulated_action_losses = []
+        accumulated_local_latent_frames = 0
         step_in_accumulation = 0
 
         stop_reason = "max_steps"
         while self.step < self.config.num_steps:
+            if step_in_accumulation == 0:
+                optimizer_cycle_started = time.perf_counter()
             # Get next batch (handles epoch reset automatically)
             batch = self._get_next_batch()
+            accumulated_local_latent_frames += (
+                int(batch['latents'].shape[0]) *
+                int(batch['latents'].shape[2]))
             
             losses = self._train_step(batch, step_in_accumulation)
             
@@ -630,9 +755,30 @@ class Trainer:
                 step_in_accumulation = 0
 
                 torch.cuda.synchronize()
+                optimizer_step_seconds = torch.tensor(
+                    time.perf_counter() - optimizer_cycle_started,
+                    dtype=torch.float64,
+                    device=self.device)
+                if dist.is_initialized():
+                    dist.all_reduce(
+                        optimizer_step_seconds, op=dist.ReduceOp.MAX)
+                global_latent_frames = torch.tensor(
+                    accumulated_local_latent_frames,
+                    dtype=torch.int64,
+                    device=self.device)
+                if dist.is_initialized():
+                    dist.all_reduce(
+                        global_latent_frames, op=dist.ReduceOp.SUM)
+                accumulated_local_latent_frames = 0
                 if self.step % self.config.gc_interval == 0:
                     torch.cuda.empty_cache()
                     gc.collect()
+                peak_memory = torch.tensor([
+                    torch.cuda.max_memory_allocated(self.device),
+                    torch.cuda.max_memory_reserved(self.device),
+                ], dtype=torch.int64, device=self.device)
+                if dist.is_initialized():
+                    dist.all_reduce(peak_memory, op=dist.ReduceOp.MAX)
 
                 #写 training_metrics.jsonl；更新进度条；上传 WandB
                 if self.config.rank == 0:
@@ -646,7 +792,21 @@ class Trainer:
                         'grad_norm': total_norm.item(),
                         'lr': lr,
                         'elapsed_seconds': time.time() - self.training_started_at,
+                        'optimizer_step_seconds': float(
+                            optimizer_step_seconds.item()),
+                        'global_latent_frames': int(
+                            global_latent_frames.item()),
+                        'global_latent_frames_per_second': float(
+                            global_latent_frames.item() /
+                            optimizer_step_seconds.item()),
+                        'peak_memory_allocated_bytes': int(peak_memory[0]),
+                        'peak_memory_reserved_bytes': int(peak_memory[1]),
                     }
+                    if 'gist_grad_norm' in losses:
+                        metric['gist_grad_norm'] = float(
+                            losses['gist_grad_norm'].item())
+                        metric['gist_update_max'] = float(
+                            losses['gist_update_max'].item())
                     with self.metrics_path.open('a') as stream:
                         stream.write(json.dumps(metric) + '\n')
                     progress_bar.n += 1
@@ -658,14 +818,28 @@ class Trainer:
                         'lr': f'{lr:.2e}'
                     })
                     if self.config.enable_wandb:
-                        self.wandb.log({
+                        wandb_metric = {
                             'loss_metrics/global_avg_video_loss': latent_loss_show,
                             'loss_metrics/global_avg_action_loss': action_loss_show,
                             'loss_metrics/global_max_video_loss': max_latent_loss_show,
                             'loss_metrics/global_max_action_loss': max_action_loss_show,
                             'grad_norm': total_norm.item(),
                             'lr': lr,
-                        }, step=self.step)
+                            'peak_memory_allocated_bytes': metric[
+                                'peak_memory_allocated_bytes'],
+                            'peak_memory_reserved_bytes': metric[
+                                'peak_memory_reserved_bytes'],
+                            'optimizer_step_seconds': metric[
+                                'optimizer_step_seconds'],
+                            'global_latent_frames_per_second': metric[
+                                'global_latent_frames_per_second'],
+                        }
+                        if 'gist_grad_norm' in metric:
+                            wandb_metric['gist_grad_norm'] = metric[
+                                'gist_grad_norm']
+                            wandb_metric['gist_update_max'] = metric[
+                                'gist_update_max']
+                        self.wandb.log(wandb_metric, step=self.step)
                 
                 self.step += 1
                 # 是否到验证间隔50步；是否到保存间隔3000步；是否满足early stop

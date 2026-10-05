@@ -1,6 +1,7 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import argparse
 import copy
+import hashlib
 import json
 import os
 import sys
@@ -31,6 +32,7 @@ from modules.utils import (
     load_transformer,
     load_vae,
 )
+from modules.memorywam import commit_memory
 from utils import (
     FlowMatchScheduler,
     data_seq_to_patch,
@@ -110,6 +112,8 @@ class VA_Server:
                                             device=self.device,
                                             eval_mode=True,
                                             )
+        self.memorywam_enabled = (
+            getattr(self.transformer, "memorywam_policy", None) is not None)
 
         self.env_type = job_config.env_type
         self.streaming_vae_half = None
@@ -393,13 +397,20 @@ class VA_Server:
         video_latent = torch.cat(mu_norm.split(1, dim=0), dim=-1)
         return video_latent.to(self.device)
 
-    def _reset(self, prompt=None):
+    def _reset(self, prompt=None, episode_id=None):
         logger.info('Reset.')
-        self.use_cfg = (self.job_config.guidance_scale > 1) or (self.job_config.action_guidance_scale > 1)
+        if self.memorywam_enabled:
+            # The first production MemoryWAM path is action-only.  Video CFG
+            # must not silently duplicate the persistent memory batch.
+            self.use_cfg = self.job_config.action_guidance_scale > 1
+        else:
+            self.use_cfg = ((self.job_config.guidance_scale > 1) or
+                            (self.job_config.action_guidance_scale > 1))
         #### Reset all parameters
         self.frame_st_id = 0
         self.inference_chunk = 0
         self.init_latent = None
+        self.memorywam_request_cache = {}
         #### clean vae and transformer cache
         self.transformer.clear_cache(self.cache_name)
         self.streaming_vae.clear_cache()
@@ -421,14 +432,21 @@ class VA_Server:
                                       patch_size[0] * patch_size[1] *
                                       patch_size[2])
         action_token_per_chunk = self.job_config.frame_chunk_size * self.action_per_frame
-        self.transformer.create_empty_cache(self.cache_name,
-                                            self.job_config.attn_window,
-                                            latent_token_per_chunk,
-                                            action_token_per_chunk,
-                                            dtype=self.dtype,
-                                            device=self.device,
-                                            batch_size = 2 if self.use_cfg else 1
-                                            )
+        if self.memorywam_enabled:
+            if episode_id is None:
+                episode_id = f"server:{time.time_ns()}"
+            self.memorywam_episode_id = str(episode_id)
+            self.memorywam_state = self.transformer.create_memorywam_state(
+                self.memorywam_episode_id,
+                batch_size=2 if self.use_cfg else 1,
+                device=self.device,
+                dtype=self.dtype)
+        else:
+            self.transformer.create_empty_cache(
+                self.cache_name, self.job_config.attn_window,
+                latent_token_per_chunk, action_token_per_chunk,
+                dtype=self.dtype, device=self.device,
+                batch_size=2 if self.use_cfg else 1)
 
         self.action_mask = torch.zeros([self.job_config.action_dim]).bool()
         self.action_mask[self.job_config.used_action_channel_ids] = True
@@ -460,7 +478,135 @@ class VA_Server:
         os.makedirs(self.exp_save_root, exist_ok=True)
         torch.cuda.empty_cache()
 
+    @staticmethod
+    def _memorywam_latent_digest(latent):
+        value = latent.detach().cpu().contiguous()
+        digest = hashlib.sha256(
+            str((value.dtype, tuple(value.shape))).encode())
+        digest.update(value.view(torch.uint8).numpy().tobytes())
+        return digest.hexdigest()
+
+    def _memorywam_observation_digest(self, obs):
+        digest = hashlib.sha256()
+        images = obs['obs'] if isinstance(obs['obs'], list) else [obs['obs']]
+        for image_set in images:
+            for key in self.job_config.obs_cam_keys:
+                value = np.ascontiguousarray(image_set[key])
+                digest.update(key.encode())
+                digest.update(str((value.dtype, value.shape)).encode())
+                digest.update(value.tobytes())
+        return digest.hexdigest()
+
+    def _memorywam_observation_receipt(self, observation_id):
+        return next((receipt for receipt in self.memorywam_state.receipts
+                     if receipt.observation_id == str(observation_id)), None)
+
+    @torch.no_grad()
+    def _memorywam_commit_latents(self, latents, observation_id,
+                                  global_frame_id=None,
+                                  observation_digest=None):
+        """Atomically commit clean VAE latents; denoising never calls this."""
+        if latents is None:
+            raise ValueError("MemoryWAM observation encoded no latent frame")
+        if latents.shape[2] != 1:
+            raise ValueError(
+                "MemoryWAM service commits exactly one latent frame per "
+                "observation message")
+        if global_frame_id is not None and int(global_frame_id) != int(
+                self.memorywam_state.next_frame_id):
+            raise ValueError(
+                "MemoryWAM global_frame_id does not match the next frame")
+        base_observation_id = str(observation_id)
+        for local_frame in range(latents.shape[2]):
+            frame_id = self.memorywam_state.next_frame_id
+            frame_observation_id = base_observation_id
+            frame_digest = observation_digest
+            frame_latent = latents[:, :, local_frame:local_frame + 1]
+            prepared = self._prepare_latent_input(
+                frame_latent, None, frame_st_id=frame_id)
+            prefill_input = self._repeat_input_for_cfg(
+                prepared['latent_res_lst'])
+            _, delta = self.transformer.memorywam_prefill_observation(
+                prefill_input, self.memorywam_state, frame_id=frame_id,
+                observation_id=frame_observation_id,
+                observation_digest=(frame_digest or
+                                    self._memorywam_latent_digest(
+                                        frame_latent)))
+            self.memorywam_state = commit_memory(
+                self.memorywam_state, delta,
+                self.transformer.memorywam_policy, detach=True)
+        self.frame_st_id = self.memorywam_state.next_frame_id
+
+    @torch.no_grad()
+    def _infer_memorywam(self, obs):
+        """Generate one APF action group from committed observed memory."""
+        if self.memorywam_state.next_frame_id == 0:
+            observation_id = obs.get(
+                'observation_id', f"{self.memorywam_episode_id}:frame:0")
+            observation_digest = self._memorywam_observation_digest(obs)
+            initial_latent = self._encode_obs(obs)
+            self.init_latent = initial_latent
+            self._memorywam_commit_latents(
+                initial_latent, observation_id,
+                global_frame_id=obs.get('global_frame_id', 0),
+                observation_digest=observation_digest)
+
+        actions = torch.randn(
+            1, self.job_config.action_dim, 1,
+            self.job_config.action_per_frame, 1,
+            device=self.device, dtype=self.dtype)
+        self.action_scheduler.set_timesteps(
+            self.job_config.action_num_inference_steps)
+        action_timesteps = F.pad(
+            self.action_scheduler.timesteps, (0, 1),
+            mode='constant', value=0)
+        decision_frame_id = self.memorywam_state.next_frame_id - 1
+        target_frame_id = self.memorywam_state.next_frame_id
+        state_version = self.memorywam_state.version
+        for index, timestep in enumerate(tqdm(action_timesteps)):
+            last_step = index == len(action_timesteps) - 1
+            prepared = self._prepare_latent_input(
+                None, actions, action_t=timestep,
+                frame_st_id=target_frame_id)
+            prediction = self.transformer.memorywam_denoise(
+                self._repeat_input_for_cfg(prepared['action_res_lst']),
+                self.memorywam_state, action_mode=True)
+            if not last_step:
+                prediction = rearrange(
+                    prediction, 'b (f n) c -> b c f n 1', f=1)
+                if self.job_config.action_guidance_scale > 1:
+                    prediction = prediction[1:] + self.job_config.action_guidance_scale * (
+                        prediction[:1] - prediction[1:])
+                else:
+                    prediction = prediction[:1]
+                actions = self.action_scheduler.step(
+                    prediction, timestep, actions, return_dict=False)
+            if self.memorywam_state.version != state_version:
+                raise RuntimeError("Denoising mutated persistent MemoryWAM state")
+
+        actions[:, ~self.action_mask] *= 0
+        save_async(actions, os.path.join(
+            self.exp_save_root, f'actions_memory_{decision_frame_id}.pt'))
+        result = self.postprocess_action(actions)
+        # Compatibility with the existing RMBench client, which skips action
+        # frame zero only on the first request.  New clients should consume
+        # action_start_index and may remove this padding after protocol rollout.
+        action_start_index = 0
+        if decision_frame_id == 0:
+            result = np.concatenate((np.zeros_like(result[:, :1]), result),
+                                    axis=1)
+            action_start_index = 1
+        return {
+            'action': result,
+            'action_start_index': action_start_index,
+            'memory_version': self.memorywam_state.version,
+            'decision_frame_id': decision_frame_id,
+        }
+
     def _infer(self, obs, frame_st_id=0):
+        if self.memorywam_enabled:
+            result = self._infer_memorywam(obs)
+            return result['action'], None
         frame_chunk_size = self.job_config.frame_chunk_size
         if frame_st_id == 0:
             init_latent = self._encode_obs(obs)
@@ -590,6 +736,35 @@ class VA_Server:
         return actions, latents
 
     def _compute_kv_cache(self, obs):
+        if self.memorywam_enabled:
+            observation_id = obs.get('observation_id')
+            observation_digest = self._memorywam_observation_digest(obs)
+            if observation_id is not None:
+                receipt = self._memorywam_observation_receipt(observation_id)
+                if receipt is not None:
+                    if receipt.digest != observation_digest:
+                        raise ValueError(
+                            "MemoryWAM observation_id was reused with "
+                            "different images")
+                    return {
+                        'memory_version': self.memorywam_state.version,
+                        'next_frame_id': self.memorywam_state.next_frame_id,
+                        'duplicate_observation': True,
+                    }
+            latent_model_input = self._encode_obs(obs)
+            if observation_id is None:
+                observation_id = (
+                    f"{self.memorywam_episode_id}:frame:"
+                    f"{self.memorywam_state.next_frame_id}")
+            self._memorywam_commit_latents(
+                latent_model_input, observation_id,
+                global_frame_id=obs.get('global_frame_id'),
+                observation_digest=observation_digest)
+            return {
+                'memory_version': self.memorywam_state.version,
+                'next_frame_id': self.memorywam_state.next_frame_id,
+                'duplicate_observation': False,
+            }
         ### optional async save obs for debug
         self.transformer.clear_pred_cache(self.cache_name)
         save_async(obs['obs'], os.path.join(self.exp_save_root, f'obs_data_{self.frame_st_id}.pt'))
@@ -631,17 +806,32 @@ class VA_Server:
 
         if reset:
             logger.info(f"******************* Reset server ******************")
-            self._reset(prompt=prompt)
+            self._reset(prompt=prompt, episode_id=obs.get('episode_id'))
+            if self.memorywam_enabled:
+                return {
+                    'episode_id': self.memorywam_episode_id,
+                    'memory_version': self.memorywam_state.version,
+                    'next_frame_id': self.memorywam_state.next_frame_id,
+                }
             return dict()
         elif compute_kv_cache:
             logger.info(
                 f"################# Compute KV Cache #################")
-            self._compute_kv_cache(obs)
-            return dict()
+            result = self._compute_kv_cache(obs)
+            return result or dict()
         else:
             logger.info(f"################# Infer One Chunk #################")
+            request_id = obs.get('request_id')
+            if (self.memorywam_enabled and request_id is not None and
+                    request_id in self.memorywam_request_cache):
+                return self.memorywam_request_cache[request_id]
             started = time.perf_counter()
-            action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
+            if self.memorywam_enabled:
+                result = self._infer_memorywam(obs)
+                action = result['action']
+            else:
+                action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
+                result = dict(action=action)
             if self.wandb_run is not None:
                 values = np.asarray(action, dtype=np.float64)
                 self.wandb_run.log({
@@ -655,7 +845,9 @@ class VA_Server:
                     ),
                 }, step=self.inference_chunk)
             self.inference_chunk += 1
-            return dict(action=action)
+            if self.memorywam_enabled and request_id is not None:
+                self.memorywam_request_cache[request_id] = result
+            return result
     
     def decode_one_video(self, latents, output_type):
         latents = latents.to(self.vae.dtype)

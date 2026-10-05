@@ -26,6 +26,10 @@ from torch.nn.attention.flex_attention import (
 )
 from functools import partial
 
+from .memorywam import (MemoryLayerKV, MemoryWAMDelta, MemoryWAMPolicy,
+                        MemoryWAMState, commit_memory, empty_memory_state,
+                        frame_metadata)
+
 try:
     from flash_attn_interface import flash_attn_func
 except:
@@ -421,6 +425,8 @@ class WanAttention(torch.nn.Module):
         rotary_emb,
         update_cache=0,
         cache_name='pos',
+        memory_kv=None,
+        return_current_kv=False,
     ):
         kv_cache = self.attn_caches[
             cache_name] if (self.attn_caches is not None) and (cache_name in self.attn_caches) else None
@@ -442,6 +448,15 @@ class WanAttention(torch.nn.Module):
                 return x_out.to(x.dtype)
             query = apply_rotary_emb(query, rotary_emb)
             key = apply_rotary_emb(key, rotary_emb)
+        current_kv = (key, value)
+        if memory_kv is not None:
+            if kv_cache is not None and kv_cache['k'] is not None:
+                raise ValueError("MemoryWAM state and legacy KV cache cannot be mixed")
+            memory_key, memory_value = memory_kv
+            if memory_key.shape[0] != key.shape[0]:
+                raise ValueError("MemoryWAM batch size differs from query batch")
+            key = torch.cat((memory_key, key), dim=1)
+            value = torch.cat((memory_value, value), dim=1)
         slots = None
         if kv_cache is not None and kv_cache['k'] is not None:
             slots = self.update_cache(cache_name,
@@ -455,7 +470,13 @@ class WanAttention(torch.nn.Module):
             key = key_pool[:, valid]
             value = value_pool[:, valid]
 
-        hidden_states = self.attn_op(query, key, value)
+        # The sequential MemoryWAM path has already selected its visible keys;
+        # it therefore uses unmasked SDPA even when legacy training selected
+        # FlexAttention with a global class-level mask.
+        if memory_kv is not None and isinstance(self.attn_op, FlexAttnFunc):
+            hidden_states = custom_sdpa(query, key, value)
+        else:
+            hidden_states = self.attn_op(query, key, value)
 
         if update_cache == 0:
             if kv_cache is not None and kv_cache['k'] is not None:
@@ -465,6 +486,8 @@ class WanAttention(torch.nn.Module):
         hidden_states = hidden_states.type_as(query)
         hidden_states = self.to_out[0](hidden_states)
         hidden_states = self.to_out[1](hidden_states)
+        if return_current_kv:
+            return hidden_states, current_kv
         return hidden_states
 
 
@@ -523,6 +546,8 @@ class WanTransformerBlock(nn.Module):
         rotary_emb,
         update_cache=0,
         cache_name='pos',
+        memory_kv=None,
+        return_current_kv=False,
     ) -> torch.Tensor:
         """
         hidden_states: noisy video token;condition video token;noisy action token;clean action token;padding token
@@ -543,12 +568,18 @@ class WanTransformerBlock(nn.Module):
         norm_hidden_states = (self.norm1(hidden_states.float()) *
                               (1. + scale_msa) +
                               shift_msa).type_as(hidden_states)
-        attn_output = self.attn1(norm_hidden_states,
+        attn_result = self.attn1(norm_hidden_states,
                                  norm_hidden_states,
                                  norm_hidden_states,
                                  rotary_emb,
                                  update_cache=update_cache,
-                                 cache_name=cache_name)
+                                 cache_name=cache_name,
+                                 memory_kv=memory_kv,
+                                 return_current_kv=return_current_kv)
+        if return_current_kv:
+            attn_output, current_kv = attn_result
+        else:
+            attn_output = attn_result
         hidden_states = (hidden_states.float() +
                          attn_output * gate_msa).type_as(hidden_states)
 
@@ -572,6 +603,8 @@ class WanTransformerBlock(nn.Module):
 
         hidden_states = (hidden_states.float() +
                          ff_output.float() * c_gate_msa).type_as(hidden_states)
+        if return_current_kv:
+            return hidden_states, current_kv
         return hidden_states
 
 
@@ -619,7 +652,12 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                  eps=1e-06,
                  rope_max_seq_len=1024,
                  pos_embed_seq_len=None,
-                 attn_mode="torch"):
+                 attn_mode="torch",
+                 memorywam_enabled=False,
+                 memorywam_gist_tokens=8,
+                 memorywam_anchor_frames=2,
+                 memorywam_recent_frames=4,
+                 memorywam_mode="hybrid"):
         r"""
         TODO
         """
@@ -658,6 +696,170 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         self.action_proj_out = nn.Linear(inner_dim, action_dim)
         self.scale_shift_table = nn.Parameter(
             torch.randn(1, 2, inner_dim) / inner_dim**0.5)
+        self.memorywam_policy = None
+        self.gist_tokens = None
+        if memorywam_enabled:
+            self.enable_memorywam(memorywam_gist_tokens,
+                                  memorywam_anchor_frames,
+                                  memorywam_recent_frames,
+                                  memorywam_mode)
+
+    def enable_memorywam(self, gist_tokens=8, anchor_frames=2,
+                         recent_frames=4, mode="hybrid"):
+        """Create the trainable gist table before FSDP/optimizer wrapping."""
+        policy = MemoryWAMPolicy.from_mode(
+            mode,
+            gist_per_frame=int(gist_tokens),
+            anchor_frames=int(anchor_frames),
+            recent_frames=int(recent_frames))
+        if self.memorywam_policy is not None:
+            if self.memorywam_policy != policy:
+                raise ValueError("MemoryWAM was already enabled with another policy")
+            return
+        hidden_dim = self.num_attention_heads * self.attention_head_dim
+        gist = torch.randn(
+            policy.gist_per_frame, hidden_dim,
+            device=self.scale_shift_table.device,
+            dtype=self.scale_shift_table.dtype) / hidden_dim**0.5
+        if policy.gist_per_frame:
+            self.gist_tokens = nn.Parameter(gist)
+        self.memorywam_policy = policy
+        self.register_to_config(
+            memorywam_enabled=True,
+            memorywam_gist_tokens=policy.gist_per_frame,
+            memorywam_anchor_frames=policy.anchor_frames,
+            memorywam_recent_frames=policy.recent_frames,
+            memorywam_mode=("full-history" if policy.full_history else
+                            str(mode).strip().lower().replace("_", "-")),
+        )
+
+    def create_memorywam_state(self, episode_id, batch_size, device=None,
+                               dtype=None):
+        if self.memorywam_policy is None:
+            raise RuntimeError("MemoryWAM is disabled")
+        reference = (self.gist_tokens if self.gist_tokens is not None else
+                     self.scale_shift_table)
+        device = device or reference.device
+        dtype = dtype or reference.dtype
+        return empty_memory_state(
+            str(episode_id), layers=len(self.blocks), batch_size=int(batch_size),
+            heads=self.num_attention_heads, head_dim=self.attention_head_dim,
+            device=torch.device(device), dtype=dtype)
+
+    def memorywam_prefill_observation(self, input_dict, state,
+                                      frame_id, observation_id,
+                                      observation_digest=None):
+        """Read one clean latent frame and return an uncommitted memory delta."""
+        if self.memorywam_policy is None:
+            raise RuntimeError("MemoryWAM is disabled")
+        latent = input_dict["noisy_latents"]
+        if latent.shape[2] != 1:
+            raise ValueError("MemoryWAM prefill accepts exactly one latent frame")
+        if int(frame_id) != state.next_frame_id:
+            raise ValueError("prefill frame does not match state.next_frame_id")
+        hidden_states = self._input_embed(latent, input_type="latent")
+        batch_size, video_tokens, _ = hidden_states.shape
+        if state.layers[0].key.shape[0] != batch_size:
+            raise ValueError("prefill batch size does not match memory state")
+        if self.gist_tokens is None:
+            gist = hidden_states.new_empty(batch_size, 0,
+                                           hidden_states.shape[-1])
+        else:
+            gist = self.gist_tokens.to(hidden_states).unsqueeze(0).expand(
+                batch_size, -1, -1)
+        hidden_states = torch.cat((hidden_states, gist), dim=1)
+
+        text_hidden_states = self._input_embed(input_dict["text_emb"],
+                                               input_type="text")
+        video_grid = input_dict["grid_id"]
+        if video_grid.shape != (batch_size, 4, video_tokens):
+            raise ValueError(("prefill grid shape", tuple(video_grid.shape),
+                              (batch_size, 4, video_tokens)))
+        gist_grid = torch.zeros(
+            batch_size, 4, self.memorywam_policy.gist_per_frame,
+            device=video_grid.device, dtype=video_grid.dtype)
+        gist_grid[:, 0] = int(frame_id)
+        gist_grid[:, 1:3] = -2
+        gist_grid[:, 3] = 2
+        rotary_emb = self.rope(torch.cat((video_grid, gist_grid), dim=2))[:, :, None]
+
+        clean_timesteps = torch.zeros(batch_size, 1, device=latent.device,
+                                      dtype=input_dict["timesteps"].dtype)
+        _, video_proj = self._time_embed(
+            clean_timesteps, latent.shape[-2], latent.shape[-1],
+            dtype=hidden_states.dtype, action_mode=False)
+        if self.memorywam_policy.gist_per_frame:
+            gist_timesteps = torch.zeros(
+                batch_size, self.memorywam_policy.gist_per_frame,
+                device=latent.device, dtype=input_dict["timesteps"].dtype)
+            _, gist_proj = self.condition_embedder(
+                gist_timesteps, dtype=hidden_states.dtype)
+            gist_proj = gist_proj.unflatten(2, (6, -1))
+        else:
+            gist_proj = video_proj.new_empty(
+                batch_size, 0, *video_proj.shape[2:])
+        timestep_proj = torch.cat((video_proj, gist_proj), dim=1)
+
+        meta = frame_metadata(
+            int(frame_id), video_tokens=video_tokens,
+            gist_tokens=self.memorywam_policy.gist_per_frame,
+            device=hidden_states.device)
+        current_layers = []
+        for index, block in enumerate(self.blocks):
+            history = state.layers[index]
+            hidden_states, current_kv = block(
+                hidden_states, text_hidden_states, timestep_proj, rotary_emb,
+                memory_kv=(history.key, history.value),
+                return_current_kv=True)
+            current_layers.append(MemoryLayerKV(
+                current_kv[0], current_kv[1], *meta))
+        delta = MemoryWAMDelta(
+            state.episode_id, int(frame_id), str(observation_id),
+            tuple(current_layers), state.version, observation_digest)
+        return hidden_states, delta
+
+    def memorywam_denoise(self, input_dict, state, action_mode=True):
+        """Denoise against persistent visual memory without mutating it."""
+        if self.memorywam_policy is None:
+            raise RuntimeError("MemoryWAM is disabled")
+        if state.next_frame_id == 0:
+            raise ValueError("MemoryWAM denoise requires an observed frame")
+        latent = input_dict["noisy_latents"]
+        input_type = "action" if action_mode else "latent"
+        hidden_states = self._input_embed(latent, input_type=input_type)
+        text_hidden_states = self._input_embed(input_dict["text_emb"],
+                                               input_type="text")
+        rotary_emb = self.rope(input_dict["grid_id"])[:, :, None]
+        _, timestep_proj = self._time_embed(
+            input_dict["timesteps"], latent.shape[-2], latent.shape[-1],
+            dtype=hidden_states.dtype, action_mode=action_mode)
+        for index, block in enumerate(self.blocks):
+            history = state.layers[index]
+            hidden_states = block(
+                hidden_states, text_hidden_states, timestep_proj, rotary_emb,
+                memory_kv=(history.key, history.value))
+
+        time_embedder = (self.condition_embedder_action if action_mode
+                         else self.condition_embedder)
+        patch_scale_h, patch_scale_w = ((1, 1) if action_mode else
+                                        (self.patch_size[1], self.patch_size[2]))
+        token_timesteps = torch.repeat_interleave(
+            input_dict["timesteps"],
+            (latent.shape[-2] // patch_scale_h) *
+            (latent.shape[-1] // patch_scale_w), dim=1)
+        temb, _ = time_embedder(token_timesteps, dtype=hidden_states.dtype)
+        temb_scale_shift_table = self.scale_shift_table[None] + temb[:, :, None]
+        shift, scale = rearrange(temb_scale_shift_table,
+                                 'b l n c -> b n l c').chunk(2, dim=1)
+        hidden_states = (self.norm_out(hidden_states.float()) *
+                         (1. + scale.to(hidden_states.device).squeeze(1)) +
+                         shift.to(hidden_states.device).squeeze(1)).type_as(
+                             hidden_states)
+        if action_mode:
+            return self.action_proj_out(hidden_states)
+        hidden_states = self.proj_out(hidden_states)
+        return rearrange(hidden_states, 'b l (n c) -> b (l n) c',
+                         n=math.prod(self.patch_size))
 
     def clear_cache(self, cache_name):
         for block in self.blocks:
@@ -816,6 +1018,108 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
 
         return latent_hidden_states, action_hidden_states
 
+    def forward_train_memorywam(self, input_dict):
+        """Causal full-episode reference training for the shared backbone.
+
+        Each observed clean ``z[t]`` is committed once, then noisy video and
+        action targets for ``t+1`` read that state.  This path intentionally
+        favors auditable semantics over throughput; ordered chunk/TBPTT is a
+        later optimization.
+        """
+        if self.memorywam_policy is None:
+            raise RuntimeError("MemoryWAM is disabled")
+        if "memory_meta" not in input_dict:
+            raise ValueError("MemoryWAM training requires memory_meta")
+        latent_dict = input_dict["latent_dict"]
+        action_dict = input_dict["action_dict"]
+        for key in ("noisy_latents", "latent"):
+            latent_dict[key] = latent_dict[key].to(torch.bfloat16)
+            action_dict[key] = action_dict[key].to(torch.bfloat16)
+        batch_size, _, frames, latent_h, latent_w = latent_dict[
+            "noisy_latents"].shape
+        if batch_size != 1:
+            raise ValueError(
+                "Initial MemoryWAM full-episode reference requires batch_size=1")
+        if action_dict["noisy_latents"].shape[2] != frames:
+            raise ValueError("video/action latent frame counts differ")
+        meta = input_dict["memory_meta"]
+        global_ids = meta["global_frame_ids"]
+        if global_ids.shape != (batch_size, frames):
+            raise ValueError(("global frame shape", tuple(global_ids.shape),
+                              (batch_size, frames)))
+        if not torch.equal(global_ids[0], torch.arange(
+                frames, device=global_ids.device, dtype=global_ids.dtype)):
+            raise ValueError(
+                "Initial full-episode MemoryWAM path requires global IDs 0..F-1")
+        episode_id = (f"{int(meta['dataset_numeric_id'][0])}:"
+                      f"{int(meta['episode_index'][0])}")
+        state = self.create_memorywam_state(
+            episode_id, batch_size, device=latent_dict["latent"].device,
+            dtype=(self.gist_tokens.dtype if self.gist_tokens is not None else
+                   self.scale_shift_table.dtype))
+        video_tokens_per_frame = ((latent_h // self.patch_size[1]) *
+                                  (latent_w // self.patch_size[2]))
+        action_tokens_per_frame = (action_dict["noisy_latents"].shape[-2] *
+                                   action_dict["noisy_latents"].shape[-1])
+        video_predictions = [torch.zeros(
+            batch_size, latent_h * latent_w,
+            self.proj_out.out_features // math.prod(self.patch_size),
+            device=latent_dict["noisy_latents"].device,
+            dtype=latent_dict["noisy_latents"].dtype)]
+        action_predictions = [torch.zeros(
+            batch_size, action_tokens_per_frame,
+            self.action_proj_out.out_features,
+            device=action_dict["noisy_latents"].device,
+            dtype=action_dict["noisy_latents"].dtype)]
+        detach_interval = int(meta.get("detach_interval", 0))
+
+        for frame in range(frames - 1):
+            video_grid_start = frame * video_tokens_per_frame
+            video_grid_end = (frame + 1) * video_tokens_per_frame
+            prefill = {
+                "noisy_latents": latent_dict["latent"][:, :, frame:frame + 1],
+                "timesteps": torch.zeros_like(
+                    latent_dict["timesteps"][:, frame:frame + 1]),
+                "grid_id": latent_dict["grid_id"][:, :,
+                                                       video_grid_start:video_grid_end],
+                "text_emb": latent_dict["text_emb"],
+            }
+            _, delta = self.memorywam_prefill_observation(
+                prefill, state, frame_id=frame,
+                observation_id=f"{episode_id}:frame:{frame}")
+            detach = detach_interval > 0 and (frame + 1) % detach_interval == 0
+            state = commit_memory(state, delta, self.memorywam_policy,
+                                  detach=detach, record_receipt=False)
+
+            target = frame + 1
+            video_grid_start = target * video_tokens_per_frame
+            video_grid_end = (target + 1) * video_tokens_per_frame
+            video_input = {
+                "noisy_latents": latent_dict["noisy_latents"][:, :,
+                                                               target:target + 1],
+                "timesteps": latent_dict["timesteps"][:, target:target + 1],
+                "grid_id": latent_dict["grid_id"][:, :,
+                                                       video_grid_start:video_grid_end],
+                "text_emb": latent_dict["text_emb"],
+            }
+            video_predictions.append(
+                self.memorywam_denoise(video_input, state, action_mode=False))
+
+            action_grid_start = target * action_tokens_per_frame
+            action_grid_end = (target + 1) * action_tokens_per_frame
+            action_input = {
+                "noisy_latents": action_dict["noisy_latents"][:, :,
+                                                               target:target + 1],
+                "timesteps": action_dict["timesteps"][:, target:target + 1],
+                "grid_id": action_dict["grid_id"][:, :,
+                                                       action_grid_start:action_grid_end],
+                "text_emb": action_dict["text_emb"],
+            }
+            action_predictions.append(
+                self.memorywam_denoise(action_input, state, action_mode=True))
+        return (torch.cat(video_predictions, dim=1),
+                torch.cat(action_predictions, dim=1))
+
     def forward(
         self,
         input_dict,
@@ -844,6 +1148,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                 List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
         """
         if train_mode:
+            if self.memorywam_policy is not None:
+                return self.forward_train_memorywam(input_dict)
             return self.forward_train(input_dict)
         if action_mode:  # action input emb
             latent_hidden_states = rearrange(input_dict['noisy_latents'],

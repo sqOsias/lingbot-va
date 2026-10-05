@@ -108,9 +108,14 @@ class MultiLatentLeRobotDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx) -> dict:
         assert idx < len(self)
-        cur_dset = self._datasets[self.item_id_to_dataset_id[idx]]
-        local_idx = idx - self.acc_dset_num[self.item_id_to_dataset_id[idx]]
-        return cur_dset[local_idx]
+        dataset_id = self.item_id_to_dataset_id[idx]
+        cur_dset = self._datasets[dataset_id]
+        local_idx = idx - self.acc_dset_num[dataset_id]
+        sample = cur_dset[local_idx]
+        if "episode_index" in sample:
+            sample["dataset_numeric_id"] = torch.tensor(dataset_id,
+                                                         dtype=torch.long)
+        return sample
 
 class LatentLeRobotDataset(LeRobotDataset):
     def __init__(
@@ -156,6 +161,7 @@ class LatentLeRobotDataset(LeRobotDataset):
         self.q01 = np.array(config.norm_stat['q01'], dtype='float')[None]
         self.q99 = np.array(config.norm_stat['q99'], dtype='float')[None]
         self.dataset_adapter = getattr(config, 'dataset_adapter', None)
+        self.memory_alignment = None
         if self.dataset_adapter == 'rmbench':
             anchor_path = self.root / 'observation_anchors.json'
             with anchor_path.open() as stream:
@@ -165,6 +171,19 @@ class LatentLeRobotDataset(LeRobotDataset):
                     np.asarray(record['origin'], dtype=np.float32)
                 for record in anchor_records
             }
+            alignment_path = getattr(config, "memory_alignment_path", None)
+            if alignment_path:
+                records = [json.loads(line) for line in
+                           Path(alignment_path).read_text().splitlines()
+                           if line.strip()]
+                self.memory_alignment = {}
+                for record in records:
+                    key = (int(record["episode_index"]),
+                           int(record["segment_start_frame"]),
+                           int(record["segment_end_frame"]))
+                    if key in self.memory_alignment:
+                        raise ValueError(f"Duplicate memory alignment: {key}")
+                    self.memory_alignment[key] = record
         self._hf_torch_view = self.hf_dataset.with_format(
                 type='torch',
                 columns=['action'],
@@ -409,6 +428,39 @@ class LatentLeRobotDataset(LeRobotDataset):
         )
 
         out_dict['latents'] = out_dict['latents'].permute(3, 0, 1, 2)
+        if self.memory_alignment is not None:
+            key = (int(episode_index), int(local_start_frame),
+                   int(local_end_frame))
+            if key not in self.memory_alignment:
+                raise KeyError(f"Missing memory alignment for {key}")
+            record = self.memory_alignment[key]
+            decisions = record["decisions"]
+            if out_dict['latents'].shape[1] != int(record["latent_frames"]):
+                raise ValueError((key, out_dict['latents'].shape,
+                                  record["latent_frames"]))
+            out_dict.update({
+                "episode_index": torch.tensor(episode_index, dtype=torch.long),
+                "segment_index": torch.tensor(record["segment_index"],
+                                               dtype=torch.long),
+                "global_frame_ids": torch.tensor(record["global_frame_ids"],
+                                                  dtype=torch.long),
+                "source_rgb_indices": torch.tensor(
+                    record["latent_source_rgb_indices"], dtype=torch.long),
+                "decision_frame_ids": torch.tensor(
+                    [item["decision_global_frame_id"] for item in decisions],
+                    dtype=torch.long),
+                "target_frame_ids": torch.tensor(
+                    [item["target_global_frame_id"] for item in decisions],
+                    dtype=torch.long),
+                "target_action_group_ids": torch.tensor(
+                    [item["target_action_group_id"] for item in decisions],
+                    dtype=torch.long),
+                "video_target_mask": torch.tensor(
+                    record["video_target_valid_by_latent"], dtype=torch.bool),
+                "action_valid_slots_by_latent": torch.tensor(
+                    record["action_valid_slots_by_latent"], dtype=torch.long),
+                "reset_mask": torch.tensor(True, dtype=torch.bool),
+            })
         return out_dict
 
     def __len__(self):
